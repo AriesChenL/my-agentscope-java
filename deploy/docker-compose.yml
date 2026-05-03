@@ -92,7 +92,7 @@ services:
 
   # ---- Nginx: sticky 路由 + SSE 透传 ----
   nginx:
-    image: nginx:1.27-alpine
+    image: nginx:trixie-perl
     ports:
       - "80:80"
     volumes:
