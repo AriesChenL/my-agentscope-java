@@ -21,6 +21,7 @@ import com.lynn.myagentscopejava.core.session.FileSystemSession;
 import com.lynn.myagentscopejava.core.session.Session;
 import com.lynn.myagentscopejava.core.tool.ToolProvider;
 import com.lynn.myagentscopejava.core.tool.Toolkit;
+import com.lynn.myagentscopejava.core.hook.PendingToolRecoveryHook;
 import com.lynn.myagentscopejava.core.hook.ToolConfirmationHook;
 import com.lynn.myagentscopejava.tools.UserInteractionTool;
 import com.lynn.myagentscopejava.tools.WebSearchTool;
@@ -226,6 +227,20 @@ public class AgentAutoConfiguration {
             havingValue = "true", matchIfMissing = true)
     public UserInteractionTool userInteractionTool() {
         return new UserInteractionTool();
+    }
+
+    /**
+     * "孤儿 tool_calls 自动修复" Hook。
+     *
+     * <p>注册为 Spring bean 后会被自动注入到 {@link ChatService} 与默认 {@link ReActAgent} 的
+     * hooks 列表，在 {@link com.lynn.myagentscopejava.core.hook.PreCallEvent} 时机扫描 memory，
+     * 给最近一条 ASSISTANT 中没有对应 ToolResultBlock 的 ToolUseBlock 补合成错误结果。
+     *
+     * <p>对应上游 agentscope-java 的 {@code PendingToolRecoveryHook}。
+     */
+    @Bean
+    public PendingToolRecoveryHook pendingToolRecoveryHook(AgentProperties props) {
+        return new PendingToolRecoveryHook(props.getName());
     }
 
     /**

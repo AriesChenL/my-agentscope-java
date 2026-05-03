@@ -9,7 +9,6 @@ import com.lynn.myagentscopejava.core.memory.CompactingMemory;
 import com.lynn.myagentscopejava.core.memory.InMemoryMemory;
 import com.lynn.myagentscopejava.core.memory.Memory;
 import com.lynn.myagentscopejava.core.message.ContentBlock;
-import com.lynn.myagentscopejava.core.message.MessageHealing;
 import com.lynn.myagentscopejava.core.message.Msg;
 import com.lynn.myagentscopejava.core.message.MsgRole;
 import com.lynn.myagentscopejava.core.message.ToolResultBlock;
@@ -357,8 +356,11 @@ public class ChatService {
                     Memory memory = memoryFactory.get();
                     try {
                         if (session.exists(key)) memory.loadFrom(session, key);
-                        // 修复历史中的孤儿 tool_calls（上一轮中断/崩溃留下的），否则模型 API 会返回 400
-                        MessageHealing.healOrphanToolCalls(memory, agentName);
+                        // 给 hook 一次预处理 memory 的机会（PendingToolRecoveryHook 在此修复孤儿 tool_calls，
+                        // 否则下一轮模型 API 会以 400 拒绝）
+                        fireSafely(new com.lynn.myagentscopejava.core.hook.PreCallEvent(
+                                null, memory,
+                                userInput != null ? List.of(userInput) : List.of()));
                         if (userInput != null) memory.addMessage(userInput);
                         runReactLoop(key, sink, memory, token);
                         memory.saveTo(session, key);
@@ -420,7 +422,8 @@ public class ChatService {
                                 .name(agentName).role(MsgRole.ASSISTANT).content(blocks).build());
                         // 这条 assistant 可能带半截 tool_calls（流式中断时常见）；立刻补合成结果，
                         // 避免下一轮加载历史时再次 400
-                        MessageHealing.healOrphanToolCalls(memory, agentName);
+                        fireSafely(new com.lynn.myagentscopejava.core.hook.PreCallEvent(
+                                null, memory, List.of()));
                     }
                     throw ex instanceof AgentInterruptedException aie ? aie
                             : new AgentInterruptedException("chat 被中断", src, ex);
@@ -541,8 +544,8 @@ public class ChatService {
         if (!hooks.isEmpty()) b.hooks(hooks);
         ReActAgent agent = b.build();
         agent.loadFrom(session, key);
-        // 修复历史中的孤儿 tool_calls（上一轮被中断/崩溃留下的）
-        MessageHealing.healOrphanToolCalls(agent.getMemory(), agentName);
+        // 孤儿 tool_calls 的修复由 PendingToolRecoveryHook 在 agent.call() 入口的
+        // PreCallEvent 时机自动处理；这里不再重复调用。
         return agent;
     }
 

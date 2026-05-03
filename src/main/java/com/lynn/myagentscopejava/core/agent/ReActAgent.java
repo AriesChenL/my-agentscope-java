@@ -5,6 +5,7 @@ import com.lynn.myagentscopejava.core.hook.HookEvent;
 import com.lynn.myagentscopejava.core.hook.PostActingEvent;
 import com.lynn.myagentscopejava.core.hook.PostReasoningEvent;
 import com.lynn.myagentscopejava.core.hook.PreActingEvent;
+import com.lynn.myagentscopejava.core.hook.PreCallEvent;
 import com.lynn.myagentscopejava.core.hook.PreReasoningEvent;
 import com.lynn.myagentscopejava.core.interruption.CancellationToken;
 import com.lynn.myagentscopejava.core.interruption.InterruptSource;
@@ -95,6 +96,12 @@ public class ReActAgent {
         CancellationToken token = new CancellationToken();
         currentToken.set(token);
         try {
+            // 给 hook 一次"在 reasoning 之前修复 / 预处理 memory"的机会
+            // 内置的 PendingToolRecoveryHook 会在这里把孤儿 tool_calls 补合成结果
+            PreCallEvent pre = new PreCallEvent(this, memory,
+                    userInput != null ? List.of(userInput) : List.of());
+            fire(pre);
+
             if (isAwaitingHumanInput()) {
                 resumeWithHumanInput(userInput);
             } else if (userInput != null) {
