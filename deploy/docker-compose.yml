@@ -38,6 +38,9 @@ services:
   # ---- 3 个 agent 节点 (生产可继续扩展, agent-N 即可) ----
   agent-1: &agent-template
     image: my-agentscope-java:latest
+    # 把 agent-1 的 8080 暴露到宿主 8081，方便 nginx 不可用时直接访问任一节点验证
+    ports:
+      - "8888:8080"
     environment:
       SPRING_PROFILES_ACTIVE: distributed
       PG_URL: jdbc:postgresql://postgres:5432/agentscope
@@ -59,6 +62,7 @@ services:
 
   agent-2:
     <<: *agent-template
+    ports: []     # 覆盖 anchor 合并过来的 8888 暴露，agent-2 仅集群内访问
     environment:
       SPRING_PROFILES_ACTIVE: distributed
       PG_URL: jdbc:postgresql://postgres:5432/agentscope
@@ -73,6 +77,7 @@ services:
 
   agent-3:
     <<: *agent-template
+    ports: []
     environment:
       SPRING_PROFILES_ACTIVE: distributed
       PG_URL: jdbc:postgresql://postgres:5432/agentscope
