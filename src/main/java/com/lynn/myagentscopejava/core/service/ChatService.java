@@ -1,6 +1,8 @@
 package com.lynn.myagentscopejava.core.service;
 
 import com.lynn.myagentscopejava.core.agent.ReActAgent;
+import com.lynn.myagentscopejava.core.cluster.DistributedLock;
+import com.lynn.myagentscopejava.core.cluster.impl.LocalDistributedLock;
 import com.lynn.myagentscopejava.core.hook.Hook;
 import com.lynn.myagentscopejava.core.interruption.AgentInterruptedException;
 import com.lynn.myagentscopejava.core.interruption.CancellationToken;
@@ -31,7 +33,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 
 /**
@@ -65,7 +66,7 @@ public class ChatService {
     private final GenerateOptions generateOptions;
     private final List<Hook> hooks;
     private final Session session;
-    private final SessionLockManager lockManager;
+    private final DistributedLock distributedLock;
     private final String agentName;
     private final String sysPrompt;
     private final int maxIters;
@@ -86,7 +87,7 @@ public class ChatService {
         this.generateOptions = b.generateOptions != null ? b.generateOptions : GenerateOptions.defaults();
         this.hooks = b.hooks != null ? List.copyOf(b.hooks) : List.of();
         this.session = b.session;
-        this.lockManager = b.lockManager != null ? b.lockManager : new SessionLockManager();
+        this.distributedLock = b.distributedLock != null ? b.distributedLock : new LocalDistributedLock();
         this.agentName = b.agentName != null ? b.agentName : "Assistant";
         this.sysPrompt = b.sysPrompt;
         this.maxIters = b.maxIters > 0 ? b.maxIters : 10;
@@ -114,9 +115,7 @@ public class ChatService {
      * @return 包含最终回复 + 本轮新增消息列表的 {@link ChatTurn}
      */
     public ChatTurn chatDetailed(SessionKey key, Msg userInput) {
-        ReentrantLock lock = lockManager.lockFor(key);
-        lock.lock();
-        try {
+        try (DistributedLock.LockHandle handle = distributedLock.acquire(key.value())) {
             ReActAgent agent = newAgentForSession(key);
             int sizeBefore = agent.getMemory().getMessages().size();
             activeCalls.put(key, agent);
@@ -131,8 +130,6 @@ public class ChatService {
             } finally {
                 activeCalls.remove(key, agent);
             }
-        } finally {
-            lock.unlock();
         }
     }
 
@@ -148,13 +145,9 @@ public class ChatService {
      * @return 处于挂起状态时返回 true
      */
     public boolean isAwaitingHumanInput(SessionKey key) {
-        ReentrantLock lock = lockManager.lockFor(key);
-        lock.lock();
-        try {
+        try (DistributedLock.LockHandle handle = distributedLock.acquire(key.value())) {
             ReActAgent agent = newAgentForSession(key);
             return agent.isAwaitingHumanInput();
-        } finally {
-            lock.unlock();
         }
     }
 
@@ -165,13 +158,9 @@ public class ChatService {
      * @return 消息列表（按时间顺序）；会话不存在返回空
      */
     public List<Msg> getMessages(SessionKey key) {
-        ReentrantLock lock = lockManager.lockFor(key);
-        lock.lock();
-        try {
+        try (DistributedLock.LockHandle handle = distributedLock.acquire(key.value())) {
             ReActAgent agent = newAgentForSession(key);
             return List.copyOf(agent.getMemory().getMessages());
-        } finally {
-            lock.unlock();
         }
     }
 
@@ -188,9 +177,7 @@ public class ChatService {
         if (compactor == null) {
             throw new IllegalStateException("应用未配置 compactor：请设置 agentscope.memory.compaction-* 相关属性");
         }
-        ReentrantLock lock = lockManager.lockFor(key);
-        lock.lock();
-        try {
+        try (DistributedLock.LockHandle handle = distributedLock.acquire(key.value())) {
             Memory memory = memoryFactory.get();
             if (session.exists(key)) memory.loadFrom(session, key);
             List<Msg> before = memory.getMessages();
@@ -205,8 +192,6 @@ public class ChatService {
             memory.saveTo(session, key);
             log.info("compactNow: 历史 {} → {} 条（session={}）", beforeSize, after.size(), key.value());
             return new CompactionResult(beforeSize, after.size());
-        } finally {
-            lock.unlock();
         }
     }
 
@@ -235,9 +220,7 @@ public class ChatService {
         if (toolCallId == null || toolCallId.isBlank()) {
             throw new IllegalArgumentException("toolCallId 必填");
         }
-        ReentrantLock lock = lockManager.lockFor(key);
-        lock.lock();
-        try {
+        try (DistributedLock.LockHandle handle = distributedLock.acquire(key.value())) {
             ReActAgent agent = newAgentForSession(key);
             if (!agent.isAwaitingHumanInput()) {
                 throw new IllegalStateException("会话当前不处于挂起状态");
@@ -255,8 +238,6 @@ public class ChatService {
                     .content(realResult)
                     .build();
             return chatDetailedNoLock(key, resumeMsg, agent);
-        } finally {
-            lock.unlock();
         }
     }
 
@@ -287,13 +268,9 @@ public class ChatService {
      * @return pending 的 ToolUseBlock 列表；非挂起状态返回空
      */
     public List<ToolUseBlock> getPendingToolUses(SessionKey key) {
-        ReentrantLock lock = lockManager.lockFor(key);
-        lock.lock();
-        try {
+        try (DistributedLock.LockHandle handle = distributedLock.acquire(key.value())) {
             ReActAgent agent = newAgentForSession(key);
             return agent.getPendingToolUses();
-        } finally {
-            lock.unlock();
         }
     }
 
@@ -348,10 +325,12 @@ public class ChatService {
      * @return 结构化 ReAct 事件流
      */
     public Flux<ReactEvent> chatReactStream(SessionKey key, Msg userInput) {
-        ReentrantLock lock = lockManager.lockFor(key);
         CancellationToken token = new CancellationToken();
+        // 锁句柄在 sink 创建时获取、doFinally 释放（流式路径无法用 try-with-resources）。
+        // 用单元素数组共享引用而不是 AtomicReference，因为这里读写在同一线程链上，无并发。
+        DistributedLock.LockHandle[] handleSlot = new DistributedLock.LockHandle[1];
         return Flux.<ReactEvent>create(sink -> {
-                    lock.lock();
+                    handleSlot[0] = distributedLock.acquire(key.value());
                     activeStreams.put(key, token);
                     Memory memory = memoryFactory.get();
                     try {
@@ -379,7 +358,10 @@ public class ChatService {
                 .subscribeOn(Schedulers.boundedElastic())
                 .doFinally(sig -> {
                     activeStreams.remove(key, token);
-                    if (lock.isHeldByCurrentThread()) lock.unlock();
+                    if (handleSlot[0] != null) {
+                        handleSlot[0].close();
+                        handleSlot[0] = null;
+                    }
                 });
     }
 
@@ -521,12 +503,8 @@ public class ChatService {
      * @param key 会话键
      */
     public void deleteSession(SessionKey key) {
-        ReentrantLock lock = lockManager.lockFor(key);
-        lock.lock();
-        try {
+        try (DistributedLock.LockHandle handle = distributedLock.acquire(key.value())) {
             session.delete(key);
-        } finally {
-            lock.unlock();
         }
     }
 
@@ -550,7 +528,7 @@ public class ChatService {
     }
 
     public Session getSession() { return session; }
-    public SessionLockManager getLockManager() { return lockManager; }
+    public DistributedLock getDistributedLock() { return distributedLock; }
 
     public static Builder builder() { return new Builder(); }
 
@@ -563,7 +541,7 @@ public class ChatService {
         private GenerateOptions generateOptions;
         private List<Hook> hooks;
         private Session session;
-        private SessionLockManager lockManager;
+        private DistributedLock distributedLock;
         private String agentName;
         private String sysPrompt;
         private int maxIters;
@@ -575,7 +553,7 @@ public class ChatService {
         public Builder generateOptions(GenerateOptions o) { this.generateOptions = o; return this; }
         public Builder hooks(List<Hook> h) { this.hooks = h; return this; }
         public Builder session(Session s) { this.session = s; return this; }
-        public Builder lockManager(SessionLockManager lm) { this.lockManager = lm; return this; }
+        public Builder distributedLock(DistributedLock dl) { this.distributedLock = dl; return this; }
         public Builder agentName(String n) { this.agentName = n; return this; }
         public Builder sysPrompt(String p) { this.sysPrompt = p; return this; }
         public Builder maxIters(int n) { this.maxIters = n; return this; }

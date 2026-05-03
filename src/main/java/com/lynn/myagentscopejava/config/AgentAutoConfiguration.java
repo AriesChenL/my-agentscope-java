@@ -14,7 +14,10 @@ import com.lynn.myagentscopejava.core.model.GeminiChatModel;
 import com.lynn.myagentscopejava.core.model.GenerateOptions;
 import com.lynn.myagentscopejava.core.model.OpenAIChatModel;
 import com.lynn.myagentscopejava.core.service.ChatService;
-import com.lynn.myagentscopejava.core.service.SessionLockManager;
+import com.lynn.myagentscopejava.core.cluster.DistributedLock;
+import com.lynn.myagentscopejava.core.cluster.NotificationBus;
+import com.lynn.myagentscopejava.core.cluster.impl.LocalDistributedLock;
+import com.lynn.myagentscopejava.core.cluster.impl.LocalNotificationBus;
 import com.lynn.myagentscopejava.core.conversation.ConversationDirectory;
 import com.lynn.myagentscopejava.core.conversation.FileSystemConversationDirectory;
 import com.lynn.myagentscopejava.core.session.FileSystemSession;
@@ -298,9 +301,26 @@ public class AgentAutoConfiguration {
     /**
      * 跨 ChatService 调用共享的 per-key 锁管理器。
      */
+    /**
+     * 分布式锁。单机部署用 {@link LocalDistributedLock}（进程内 ReentrantLock）；
+     * 分布式部署可换 {@code RedisDistributedLock}（Redisson）。
+     *
+     * <p>{@code @ConditionalOnMissingBean} 让上层应用可以自定义实现覆盖默认。
+     */
     @Bean
-    public SessionLockManager sessionLockManager() {
-        return new SessionLockManager();
+    @ConditionalOnMissingBean
+    public DistributedLock distributedLock() {
+        return new LocalDistributedLock();
+    }
+
+    /**
+     * 跨节点广播总线。单机用 {@link LocalNotificationBus}（进程内回调）；
+     * 分布式部署可换 {@code RedisNotificationBus}（pub/sub）。
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    public NotificationBus notificationBus() {
+        return new LocalNotificationBus();
     }
 
     /**
@@ -313,7 +333,7 @@ public class AgentAutoConfiguration {
     @Bean
     public ChatService chatService(AgentProperties props, ChatModelRouter modelRouter,
                                    Toolkit toolkit, GenerateOptions generateOptions,
-                                   Session session, SessionLockManager lockManager,
+                                   Session session, DistributedLock distributedLock,
                                    @Autowired(required = false) List<Hook> hooks) {
         AgentProperties.MemoryConfig mc = props.getMemory();
         // compactor 总是创建（只要 maxTokens / maxMessages 至少一个 > 0）。compactionEnabled 仅控制
@@ -342,7 +362,7 @@ public class AgentAutoConfiguration {
                 .toolkit(toolkit)
                 .generateOptions(generateOptions)
                 .session(session)
-                .lockManager(lockManager)
+                .distributedLock(distributedLock)
                 .agentName(props.getName())
                 .sysPrompt(props.getSysPrompt())
                 .maxIters(props.getSession().getMaxIters())
