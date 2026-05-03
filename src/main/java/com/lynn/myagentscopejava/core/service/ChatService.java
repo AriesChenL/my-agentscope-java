@@ -2,7 +2,9 @@ package com.lynn.myagentscopejava.core.service;
 
 import com.lynn.myagentscopejava.core.agent.ReActAgent;
 import com.lynn.myagentscopejava.core.cluster.DistributedLock;
+import com.lynn.myagentscopejava.core.cluster.NotificationBus;
 import com.lynn.myagentscopejava.core.cluster.impl.LocalDistributedLock;
+import com.lynn.myagentscopejava.core.cluster.impl.LocalNotificationBus;
 import com.lynn.myagentscopejava.core.hook.Hook;
 import com.lynn.myagentscopejava.core.interruption.AgentInterruptedException;
 import com.lynn.myagentscopejava.core.interruption.CancellationToken;
@@ -57,9 +59,12 @@ import java.util.function.Supplier;
  *   <li>持久化层（{@link Session}）必须线程安全 —— FileSystemSession 各 key 写不同文件天然安全</li>
  * </ul>
  */
-public class ChatService {
+public class ChatService implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(ChatService.class);
+
+    /** 跨节点 interrupt 信号的 Redis 频道名。payload 格式：{@code "sessionKey|InterruptSource"} */
+    private static final String INTERRUPT_CHANNEL = "interrupt";
 
     private final ChatModelRouter modelRouter;
     private final Toolkit toolkit;
@@ -67,6 +72,7 @@ public class ChatService {
     private final List<Hook> hooks;
     private final Session session;
     private final DistributedLock distributedLock;
+    private final NotificationBus notificationBus;
     private final String agentName;
     private final String sysPrompt;
     private final int maxIters;
@@ -79,6 +85,9 @@ public class ChatService {
     /** 当前正在执行的流式调用 token 表（chatReactStream 用）。 */
     private final ConcurrentMap<SessionKey, CancellationToken> activeStreams = new ConcurrentHashMap<>();
 
+    /** 跨节点 interrupt 频道订阅句柄；close() 时取消。 */
+    private final NotificationBus.Subscription interruptSubscription;
+
     private ChatService(Builder b) {
         if (b.modelRouter == null) throw new IllegalArgumentException("modelRouter 必填");
         if (b.session == null) throw new IllegalArgumentException("session 必填");
@@ -88,11 +97,26 @@ public class ChatService {
         this.hooks = b.hooks != null ? List.copyOf(b.hooks) : List.of();
         this.session = b.session;
         this.distributedLock = b.distributedLock != null ? b.distributedLock : new LocalDistributedLock();
+        this.notificationBus = b.notificationBus != null ? b.notificationBus : new LocalNotificationBus();
         this.agentName = b.agentName != null ? b.agentName : "Assistant";
         this.sysPrompt = b.sysPrompt;
         this.maxIters = b.maxIters > 0 ? b.maxIters : 10;
         this.memoryFactory = b.memoryFactory != null ? b.memoryFactory : InMemoryMemory::new;
         this.compactor = b.compactor;
+
+        // 订阅跨节点 interrupt 信号；本节点发布的消息也会回到这里，但 interruptLocal 是幂等的
+        // (CancellationToken.cancel 用 AtomicBoolean compareAndSet)，重复 cancel 无副作用
+        this.interruptSubscription = notificationBus.subscribe(INTERRUPT_CHANNEL, this::onInterruptSignal);
+    }
+
+    /**
+     * 释放跨节点订阅；由 Spring 容器在 destroy 时调用（{@code @Bean(destroyMethod="close")}）。
+     */
+    @Override
+    public void close() {
+        if (interruptSubscription != null) {
+            interruptSubscription.close();
+        }
     }
 
     /**
@@ -290,11 +314,25 @@ public class ChatService {
     /**
      * 指定来源中断。
      *
+     * <p><b>分布式行为</b>：先在本节点查 active 调用；找不到 → 通过 {@link NotificationBus}
+     * 广播 {@code interrupt} 频道，让其它节点订阅者各自检查本地是否有该 key 的 active。
+     *
      * @param key    会话键
      * @param source 中断来源；不同来源会影响中断标记文案与 partial 处理策略
-     * @return 是否真的中断了一个正在跑的请求
+     * @return 本节点是否中断了一个正在跑的请求；远程中断 fire-and-forget，无法立即知道结果
      */
     public boolean interrupt(SessionKey key, InterruptSource source) {
+        boolean local = interruptLocal(key, source);
+        if (!local) {
+            // 本节点没在跑这个 key，可能在别的节点 → 广播信号让对方检查
+            // 单机部署时 LocalNotificationBus 会同步回调本节点，依然 no-op，无副作用
+            notificationBus.publish(INTERRUPT_CHANNEL, key.value() + "|" + source.name());
+        }
+        return local;
+    }
+
+    /** 仅在本节点的 activeCalls / activeStreams 中查找并中断。 */
+    private boolean interruptLocal(SessionKey key, InterruptSource source) {
         boolean interrupted = false;
         ReActAgent agent = activeCalls.get(key);
         if (agent != null) {
@@ -307,6 +345,31 @@ public class ChatService {
             interrupted = true;
         }
         return interrupted;
+    }
+
+    /**
+     * 跨节点 interrupt 频道订阅 handler。payload 格式：{@code "sessionKey|InterruptSource"}。
+     *
+     * <p>消息约束：本节点也会收到自己 publish 的消息，但 {@link #interruptLocal} 是幂等的，
+     * 重复 cancel 已 cancel 的 token 无副作用，故无需额外 nodeId 过滤。
+     */
+    private void onInterruptSignal(String payload) {
+        if (payload == null) return;
+        int sep = payload.indexOf('|');
+        if (sep < 0) {
+            log.warn("跨节点 interrupt payload 格式错误：{}", payload);
+            return;
+        }
+        String keyStr = payload.substring(0, sep);
+        String srcStr = payload.substring(sep + 1);
+        try {
+            SessionKey key = SessionKey.of(keyStr);
+            InterruptSource src = InterruptSource.valueOf(srcStr);
+            // 静默：本节点没找到说明确实在别的节点（或已结束）
+            interruptLocal(key, src);
+        } catch (Exception e) {
+            log.warn("跨节点 interrupt 解析失败 payload={}: {}", payload, e.toString());
+        }
     }
 
     /**
@@ -529,6 +592,7 @@ public class ChatService {
 
     public Session getSession() { return session; }
     public DistributedLock getDistributedLock() { return distributedLock; }
+    public NotificationBus getNotificationBus() { return notificationBus; }
 
     public static Builder builder() { return new Builder(); }
 
@@ -542,6 +606,7 @@ public class ChatService {
         private List<Hook> hooks;
         private Session session;
         private DistributedLock distributedLock;
+        private NotificationBus notificationBus;
         private String agentName;
         private String sysPrompt;
         private int maxIters;
@@ -554,6 +619,7 @@ public class ChatService {
         public Builder hooks(List<Hook> h) { this.hooks = h; return this; }
         public Builder session(Session s) { this.session = s; return this; }
         public Builder distributedLock(DistributedLock dl) { this.distributedLock = dl; return this; }
+        public Builder notificationBus(NotificationBus nb) { this.notificationBus = nb; return this; }
         public Builder agentName(String n) { this.agentName = n; return this; }
         public Builder sysPrompt(String p) { this.sysPrompt = p; return this; }
         public Builder maxIters(int n) { this.maxIters = n; return this; }

@@ -158,9 +158,13 @@ public class AgentProperties {
     public static class Cluster {
         /** {@code single}（默认） 或 {@code distributed}。 */
         private String mode = "single";
+        /** 节点唯一标识；为空时自动 hostname + 启动时间戳。用于跨节点广播去重（不响应自己发的信号）。 */
+        private String nodeId;
 
         public String getMode() { return mode; }
         public void setMode(String mode) { this.mode = mode; }
+        public String getNodeId() { return nodeId; }
+        public void setNodeId(String nodeId) { this.nodeId = nodeId; }
     }
 
     /**

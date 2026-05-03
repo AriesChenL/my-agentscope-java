@@ -333,25 +333,49 @@ public class AgentAutoConfiguration {
     }
 
     /**
-     * 分布式锁。单机部署用 {@link LocalDistributedLock}（进程内 ReentrantLock）；
-     * 分布式部署可换 {@code RedisDistributedLock}（Redisson）。
-     *
-     * <p>{@code @ConditionalOnMissingBean} 让上层应用可以自定义实现覆盖默认。
+     * 分布式锁 —— 单机模式（默认）：{@link LocalDistributedLock} 进程内 ReentrantLock。
      */
     @Bean
     @ConditionalOnMissingBean
-    public DistributedLock distributedLock() {
+    @ConditionalOnProperty(prefix = "agentscope.cluster", name = "mode",
+            havingValue = "single", matchIfMissing = true)
+    public DistributedLock localDistributedLock() {
         return new LocalDistributedLock();
     }
 
     /**
-     * 跨节点广播总线。单机用 {@link LocalNotificationBus}（进程内回调）；
-     * 分布式部署可换 {@code RedisNotificationBus}（pub/sub）。
+     * 分布式锁 —— 分布式模式：{@link com.lynn.myagentscopejava.core.cluster.impl.RedisDistributedLock}
+     * 用 Redisson RLock + watchdog 自动续约。
+     *
+     * <p>启用条件：{@code agentscope.cluster.mode=distributed}。需要应用配置 Redis。
      */
     @Bean
     @ConditionalOnMissingBean
-    public NotificationBus notificationBus() {
+    @ConditionalOnProperty(prefix = "agentscope.cluster", name = "mode", havingValue = "distributed")
+    public DistributedLock redisDistributedLock(org.redisson.api.RedissonClient redisson) {
+        return new com.lynn.myagentscopejava.core.cluster.impl.RedisDistributedLock(redisson);
+    }
+
+    /**
+     * 跨节点广播总线 —— 单机模式：{@link LocalNotificationBus} 进程内同步回调。
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    @ConditionalOnProperty(prefix = "agentscope.cluster", name = "mode",
+            havingValue = "single", matchIfMissing = true)
+    public NotificationBus localNotificationBus() {
         return new LocalNotificationBus();
+    }
+
+    /**
+     * 跨节点广播总线 —— 分布式模式：{@link com.lynn.myagentscopejava.core.cluster.impl.RedisNotificationBus}
+     * 用 Redisson RTopic（Redis pub/sub）。
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    @ConditionalOnProperty(prefix = "agentscope.cluster", name = "mode", havingValue = "distributed")
+    public NotificationBus redisNotificationBus(org.redisson.api.RedissonClient redisson) {
+        return new com.lynn.myagentscopejava.core.cluster.impl.RedisNotificationBus(redisson);
     }
 
     /**
@@ -361,10 +385,11 @@ public class AgentAutoConfiguration {
      * <p>当 {@code agentscope.memory.compaction-enabled=true} 时，每个会话的 Memory 会被
      * {@link CompactingMemory} 包装，超过阈值自动用 LLM 摘要旧历史。
      */
-    @Bean
+    @Bean(destroyMethod = "close")
     public ChatService chatService(AgentProperties props, ChatModelRouter modelRouter,
                                    Toolkit toolkit, GenerateOptions generateOptions,
                                    Session session, DistributedLock distributedLock,
+                                   NotificationBus notificationBus,
                                    @Autowired(required = false) List<Hook> hooks) {
         AgentProperties.MemoryConfig mc = props.getMemory();
         // compactor 总是创建（只要 maxTokens / maxMessages 至少一个 > 0）。compactionEnabled 仅控制
@@ -394,6 +419,7 @@ public class AgentAutoConfiguration {
                 .generateOptions(generateOptions)
                 .session(session)
                 .distributedLock(distributedLock)
+                .notificationBus(notificationBus)
                 .agentName(props.getName())
                 .sysPrompt(props.getSysPrompt())
                 .maxIters(props.getSession().getMaxIters())
