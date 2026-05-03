@@ -207,15 +207,18 @@ private void resumeWithHumanInput(Msg userInput) {
 }
 ```
 
-逻辑：
+逻辑（对齐上游 agentscope-java `validateAndAddToolResults` 的校验严格度）：
 
 1. 校验 userInput 是 TOOL 角色且含 ToolResultBlock
-2. 找到 memory 末尾 TOOL 消息中所有 pending 的 id 集合
-3. 校验 userInput 把所有 pending id 都提供了（部分提供也不行，避免遗漏）
-4. **替换** memory 末尾 TOOL 消息：pending 项换成真实结果，非 pending 项保持
-5. 因为 `Memory` 没有"替换最后一条"接口，统一用 clear + 全量回填
+2. 校验提供的 ID 不重复
+3. 收集 memory 末尾 TOOL 消息中所有 pending 的 ID 集合
+4. 校验提供的 ID 都属于 pending 集合（不允许多余）
+5. **支持分批提交**：providedIds 可以是 pendingIds 的子集
+6. 部分提交时不允许混入 text 等非 ToolResultBlock 内容（避免污染上下文）
+7. **替换** memory 末尾 TOOL 消息：providedIds 对应的 pending 项换成真实结果，未填的 pending 项保持原样
+8. 因为 `Memory` 没有"替换最后一条"接口，统一用 clear + 全量回填
 
-替换完毕后回到 reactLoop，下一轮 reasoning 模型就能看到真实结果了。
+`call()` 在调完 `resumeWithHumanInput` 后会再次检查 `isAwaitingHumanInput()` —— 如果还有未填的 pending（分批提交场景），直接返回最后一条 ASSISTANT 消息，**不进 reactLoop**，等调用方下次再补。完整覆盖后才进入下一轮 reasoning。
 
 ## 7.8 acting 阶段的 HITL 短路
 

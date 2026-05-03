@@ -104,6 +104,12 @@ public class ReActAgent {
 
             if (isAwaitingHumanInput()) {
                 resumeWithHumanInput(userInput);
+                // 分批提交场景：本次只填了部分 pending 工具，其余仍待外部提供 →
+                // 不进 reactLoop，直接返回最后一条 assistant 消息让调用方再次提交
+                if (isAwaitingHumanInput()) {
+                    log.info("[{}] HITL 部分恢复，仍有 pending 工具未填，继续等待", name);
+                    return findLastAssistantMsg();
+                }
             } else if (userInput != null) {
                 memory.addMessage(userInput);
             }
@@ -112,6 +118,15 @@ public class ReActAgent {
             // 仅当本次调用的 token 还在槽位上时才清空，避免覆盖并发调用
             currentToken.compareAndSet(token, null);
         }
+    }
+
+    /** 找 memory 中最近一条 ASSISTANT 消息；找不到返回 null。 */
+    private Msg findLastAssistantMsg() {
+        List<Msg> msgs = memory.getMessages();
+        for (int i = msgs.size() - 1; i >= 0; i--) {
+            if (msgs.get(i).getRole() == MsgRole.ASSISTANT) return msgs.get(i);
+        }
+        return null;
     }
 
     /**
@@ -153,37 +168,74 @@ public class ReActAgent {
     }
 
     /**
-     * 用人工提供的工具结果替换 memory 中的 pending TOOL 消息，使 agent 能从 reasoning 阶段恢复执行。
+     * 用人工提供的工具结果替换 memory 中的 pending TOOL 消息，使 agent 能恢复执行。
+     *
+     * <p><b>支持分批提交</b>：{@code provided} 不必覆盖所有 pending 工具，未填的 pending 项保留原样，
+     * 调用方可下次再补。完整覆盖后 {@code call()} 才会进入下一轮 reasoning。
+     *
+     * <p><b>校验</b>（对齐上游 agentscope-java {@code validateAndAddToolResults} 的严格度）：
+     * <ol>
+     *   <li>消息必须是 TOOL 角色</li>
+     *   <li>必须含至少一个 ToolResultBlock</li>
+     *   <li>提供的 ID 不能重复</li>
+     *   <li>提供的 ID 必须都在 pending 集合内（不允许多余）</li>
+     *   <li>部分提供时不允许混入非 ToolResultBlock 内容（避免污染 reasoning 上下文）</li>
+     * </ol>
      */
     private void resumeWithHumanInput(Msg userInput) {
+        // 校验 1：role
         if (userInput == null || userInput.getRole() != MsgRole.TOOL) {
             throw new IllegalStateException(
                     "agent 当前处于挂起状态，需要 TOOL 角色的消息提供工具结果，实际收到："
                             + (userInput == null ? "null" : userInput.getRole()));
         }
+
+        // 校验 2：必须含 ToolResultBlock
         List<ToolResultBlock> provided = userInput.getBlocks(ToolResultBlock.class);
         if (provided.isEmpty()) {
             throw new IllegalStateException("TOOL 消息中未包含任何 ToolResultBlock");
         }
 
+        // 校验 3：不允许重复 ID
+        Set<String> providedIds = new HashSet<>();
+        for (ToolResultBlock r : provided) {
+            if (!providedIds.add(r.id())) {
+                throw new IllegalStateException("重复的 tool result id：" + r.id());
+            }
+        }
+
+        // 收集 pending 集合
         List<Msg> msgs = new ArrayList<>(memory.getMessages());
         Msg pendingToolMsg = msgs.getLast();
         List<ContentBlock> oldBlocks = pendingToolMsg.getContent();
-
         Set<String> pendingIds = oldBlocks.stream()
                 .filter(b -> b instanceof ToolResultBlock r && r.pending())
                 .map(b -> ((ToolResultBlock) b).id())
                 .collect(Collectors.toSet());
-        Set<String> providedIds = provided.stream()
-                .map(ToolResultBlock::id)
+
+        // 校验 4：不允许多余 ID
+        Set<String> invalidIds = providedIds.stream()
+                .filter(id -> !pendingIds.contains(id))
                 .collect(Collectors.toSet());
-        if (!providedIds.containsAll(pendingIds)) {
-            Set<String> missing = new HashSet<>(pendingIds);
-            missing.removeAll(providedIds);
-            throw new IllegalStateException("缺少 pending 工具的结果，未提供的 id：" + missing);
+        if (!invalidIds.isEmpty()) {
+            throw new IllegalStateException(
+                    "提供的 tool result id 不在 pending 集合中：" + invalidIds
+                            + "，预期：" + pendingIds);
         }
 
-        // 用 provided 中匹配 id 的真实结果替换 pending 项；非 pending 项保持原样
+        // 校验 5：分批提交时不允许混入 text 等其它内容块（避免被当作模型输入污染上下文）
+        boolean isPartial = !providedIds.containsAll(pendingIds);
+        boolean hasNonToolResultContent = userInput.getContent().stream()
+                .anyMatch(b -> !(b instanceof ToolResultBlock));
+        if (isPartial && hasNonToolResultContent) {
+            Set<String> missing = new HashSet<>(pendingIds);
+            missing.removeAll(providedIds);
+            throw new IllegalStateException(
+                    "部分提供 tool result 时不允许混入非 ToolResultBlock 内容；已提供："
+                            + providedIds + "，未提供：" + missing);
+        }
+
+        // 替换：providedIds 对应的 pending block → 真实结果；其余保持原样（含未填的 pending）
         Map<String, ToolResultBlock> replacement = provided.stream()
                 .collect(Collectors.toMap(ToolResultBlock::id, b -> b, (a, b) -> a));
         List<ContentBlock> newBlocks = new ArrayList<>(oldBlocks.size());
@@ -201,11 +253,13 @@ public class ReActAgent {
                 .content(newBlocks)
                 .build();
 
-        // memory 没有提供"替换最后一条"的接口，统一通过 clear + 全量回填实现
+        // memory 没有"替换最后一条"接口，统一 clear + 全量回填
         memory.clear();
         msgs.set(msgs.size() - 1, replaced);
         msgs.forEach(memory::addMessage);
-        log.info("[{}] HITL 恢复：已替换 {} 个 pending 工具结果", name, pendingIds.size());
+        log.info("[{}] HITL 恢复：替换 {}/{} 个 pending 工具结果{}",
+                name, providedIds.size(), pendingIds.size(),
+                isPartial ? "（分批提交，仍有未填）" : "");
     }
 
     /** 真正的 ReAct 循环主体。 */

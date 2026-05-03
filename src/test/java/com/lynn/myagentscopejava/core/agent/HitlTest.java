@@ -140,7 +140,7 @@ class HitlTest {
     }
 
     @Test
-    void resumeRejectsIncompleteResults() {
+    void resumeAcceptsPartialResults_keepsPendingForRest() {
         // 模型一次发起两个 tool call：deduct(100) + deduct(200)
         List<ChatChunk> turn1 = List.of(
                 ChatChunk.toolCalls(List.of(
@@ -154,11 +154,113 @@ class HitlTest {
         agent.call(Msg.user("user", "扣两笔款"));
         assertEquals(2, agent.getPendingToolUses().size());
 
-        // 只提供其中一个的结果 → 拒绝
+        // 只提供其中一个 → 允许，剩下的 pending 保留
         Msg partial = Msg.builder().name("approver").role(MsgRole.TOOL)
                 .content(ToolResultBlock.success("call_a", "ok")).build();
+        agent.call(partial);
+
+        // 模型并未被再次调用（只跑过 turn 0）
+        assertEquals(1, model.turn);
+        // 仍处于挂起态
+        assertTrue(agent.isAwaitingHumanInput());
+        // pending 列表只剩 call_b
+        List<ToolUseBlock> pending = agent.getPendingToolUses();
+        assertEquals(1, pending.size());
+        assertEquals("call_b", pending.getFirst().id());
+    }
+
+    @Test
+    void resumePartialThenComplete_resumesReasoning() {
+        List<ChatChunk> turn1 = List.of(
+                ChatChunk.toolCalls(List.of(
+                        new ToolCallDelta(0, "call_a", "deduct", "{\"amount\":100}"),
+                        new ToolCallDelta(1, "call_b", "deduct", "{\"amount\":200}"))),
+                ChatChunk.finish("tool_calls", ChatUsage.builder().build()));
+        List<ChatChunk> turn2 = List.of(
+                ChatChunk.text("两笔都已处理。"),
+                ChatChunk.finish("stop", ChatUsage.builder().build()));
+        ScriptedModel model = new ScriptedModel(List.of(turn1, turn2));
+        Toolkit kit = new Toolkit().registerObject(new ApprovalRequired());
+        ReActAgent agent = ReActAgent.builder().name("Bot").model(model).toolkit(kit).build();
+
+        agent.call(Msg.user("user", "扣两笔款"));
+
+        // 第一次只填 a
+        agent.call(Msg.builder().role(MsgRole.TOOL)
+                .content(ToolResultBlock.success("call_a", "ok-a")).build());
+        assertTrue(agent.isAwaitingHumanInput());
+
+        // 第二次填 b → 满齐 → 进 reasoning
+        Msg reply = agent.call(Msg.builder().role(MsgRole.TOOL)
+                .content(ToolResultBlock.success("call_b", "ok-b")).build());
+
+        assertEquals("两笔都已处理。", reply.getText());
+        assertFalse(agent.isAwaitingHumanInput());
+        assertEquals(2, model.turn);
+    }
+
+    @Test
+    void resumeRejectsDuplicateIds() {
+        List<ChatChunk> turn1 = List.of(
+                ChatChunk.toolCalls(List.of(
+                        new ToolCallDelta(0, "call_a", "deduct", "{\"amount\":100}"))),
+                ChatChunk.finish("tool_calls", ChatUsage.builder().build()));
+        ScriptedModel model = new ScriptedModel(List.of(turn1));
+        Toolkit kit = new Toolkit().registerObject(new ApprovalRequired());
+        ReActAgent agent = ReActAgent.builder().name("Bot").model(model).toolkit(kit).build();
+
+        agent.call(Msg.user("user", "扣款"));
+
+        Msg dup = Msg.builder().role(MsgRole.TOOL).content(List.of(
+                ToolResultBlock.success("call_a", "ok"),
+                ToolResultBlock.success("call_a", "ok again")
+        )).build();
         IllegalStateException ex = assertThrows(IllegalStateException.class,
-                () -> agent.call(partial));
-        assertTrue(ex.getMessage().contains("call_b"));
+                () -> agent.call(dup));
+        assertTrue(ex.getMessage().contains("重复"));
+        assertTrue(ex.getMessage().contains("call_a"));
+    }
+
+    @Test
+    void resumeRejectsInvalidIds() {
+        List<ChatChunk> turn1 = List.of(
+                ChatChunk.toolCalls(List.of(
+                        new ToolCallDelta(0, "call_a", "deduct", "{\"amount\":100}"))),
+                ChatChunk.finish("tool_calls", ChatUsage.builder().build()));
+        ScriptedModel model = new ScriptedModel(List.of(turn1));
+        Toolkit kit = new Toolkit().registerObject(new ApprovalRequired());
+        ReActAgent agent = ReActAgent.builder().name("Bot").model(model).toolkit(kit).build();
+
+        agent.call(Msg.user("user", "扣款"));
+
+        Msg invalid = Msg.builder().role(MsgRole.TOOL)
+                .content(ToolResultBlock.success("call_unknown", "ok")).build();
+        IllegalStateException ex = assertThrows(IllegalStateException.class,
+                () -> agent.call(invalid));
+        assertTrue(ex.getMessage().contains("call_unknown"));
+        assertTrue(ex.getMessage().contains("不在 pending 集合"));
+    }
+
+    @Test
+    void resumeRejectsPartialWithTextContent() {
+        List<ChatChunk> turn1 = List.of(
+                ChatChunk.toolCalls(List.of(
+                        new ToolCallDelta(0, "call_a", "deduct", "{\"amount\":100}"),
+                        new ToolCallDelta(1, "call_b", "deduct", "{\"amount\":200}"))),
+                ChatChunk.finish("tool_calls", ChatUsage.builder().build()));
+        ScriptedModel model = new ScriptedModel(List.of(turn1));
+        Toolkit kit = new Toolkit().registerObject(new ApprovalRequired());
+        ReActAgent agent = ReActAgent.builder().name("Bot").model(model).toolkit(kit).build();
+
+        agent.call(Msg.user("user", "扣两笔款"));
+
+        // 部分提供 + 同时混入 TextBlock → 拒绝
+        Msg partialWithText = Msg.builder().role(MsgRole.TOOL).content(List.of(
+                ToolResultBlock.success("call_a", "ok"),
+                new com.lynn.myagentscopejava.core.message.TextBlock("我先批准 a")
+        )).build();
+        IllegalStateException ex = assertThrows(IllegalStateException.class,
+                () -> agent.call(partialWithText));
+        assertTrue(ex.getMessage().contains("不允许混入"));
     }
 }
