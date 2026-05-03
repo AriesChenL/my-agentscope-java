@@ -253,11 +253,14 @@ public class AgentAutoConfiguration {
      * {@link com.lynn.myagentscopejava.web.ChatController.HitlSettingsApi} 接口）。
      * 集合为空时 hook 是 no-op，无副作用。
      */
-    @Bean
-    public ToolConfirmationHook toolConfirmationHook(AgentProperties props) {
+    @Bean(destroyMethod = "close")
+    public ToolConfirmationHook toolConfirmationHook(AgentProperties props,
+                                                     NotificationBus notificationBus,
+                                                     com.fasterxml.jackson.databind.ObjectMapper mapper) {
         List<String> initial = props.getHitl().getDangerousTools();
         return new ToolConfirmationHook(
-                initial != null ? new java.util.HashSet<>(initial) : new java.util.HashSet<>());
+                initial != null ? new java.util.HashSet<>(initial) : new java.util.HashSet<>(),
+                notificationBus, mapper);
     }
 
     /**

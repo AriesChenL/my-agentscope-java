@@ -204,7 +204,8 @@ public class ChatController {
 
         @PutMapping("/dangerous-tools")
         public Map<String, Object> setDangerousTools(@RequestBody java.util.Set<String> toolNames) {
-            hook.setDangerousTools(toolNames);
+            // 走广播版本：本节点立即生效 + 通过 NotificationBus 通知所有节点同步
+            hook.setDangerousToolsAndBroadcast(toolNames);
             return Map.of("ok", true, "dangerousTools", hook.getDangerousTools());
         }
     }

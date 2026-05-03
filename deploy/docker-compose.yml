@@ -1,0 +1,102 @@
+# =====================================================================
+# my-agentscope-java 分布式部署一键示例
+# 启动: cd deploy && docker compose up -d
+# 访问: http://localhost
+#
+# 包含: 3 节点 agent + PostgreSQL + Redis + Nginx
+# 数据持久化: postgres_data 卷 (重启后会话不丢)
+# =====================================================================
+
+services:
+
+  # ---- PostgreSQL: 会话 + 对话目录 ----
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: agentscope
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: secret_change_me
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agentscope"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ---- Redis: 分布式锁 + pub/sub ----
+  redis:
+    image: redis:8.6
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ---- 3 个 agent 节点 (生产可继续扩展, agent-N 即可) ----
+  agent-1: &agent-template
+    image: my-agentscope-java:latest
+    environment:
+      SPRING_PROFILES_ACTIVE: distributed
+      PG_URL: jdbc:postgresql://postgres:5432/agentscope
+      PG_USER: agent
+      PG_PASSWORD: secret_change_me
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      AGENTSCOPE_CLUSTER_NODE_ID: agent-1
+      # ===== 你的 LLM provider key (生产请用 secrets 不要直接配在这里) =====
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  agent-2:
+    <<: *agent-template
+    environment:
+      SPRING_PROFILES_ACTIVE: distributed
+      PG_URL: jdbc:postgresql://postgres:5432/agentscope
+      PG_USER: agent
+      PG_PASSWORD: secret_change_me
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      AGENTSCOPE_CLUSTER_NODE_ID: agent-2
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+
+  agent-3:
+    <<: *agent-template
+    environment:
+      SPRING_PROFILES_ACTIVE: distributed
+      PG_URL: jdbc:postgresql://postgres:5432/agentscope
+      PG_USER: agent
+      PG_PASSWORD: secret_change_me
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      AGENTSCOPE_CLUSTER_NODE_ID: agent-3
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+
+  # ---- Nginx: sticky 路由 + SSE 透传 ----
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - agent-1
+      - agent-2
+      - agent-3
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

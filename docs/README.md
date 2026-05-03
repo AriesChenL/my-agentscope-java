@@ -33,6 +33,12 @@
 | 11 | [HITL 三种模式](./11-hitl-three-modes.md) | `ask_user` / `ToolConfirmationHook` / `ToolSuspendException` |
 | 12 | [Memory 压缩 + 会话持久化](./12-memory-and-session.md) | `CompactingMemory`、`FileSystemSession`、并发锁 |
 
+### Part 4 · 生产部署
+
+| # | 章节 | 一句话 |
+|---|------|------|
+| 13 | [分布式部署](./13-distributed-deployment.md) | 单机→多节点改造、PG/Redis 抽象层、Nginx sticky、docker-compose 一键起 |
+
 ## "想改 X 看哪一章" 速查
 
 | 想做什么 | 主要看 |

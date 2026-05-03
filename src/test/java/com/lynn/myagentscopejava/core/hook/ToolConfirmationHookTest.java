@@ -14,6 +14,7 @@ import com.lynn.myagentscopejava.core.model.ToolCallDelta;
 import com.lynn.myagentscopejava.core.tool.Tool;
 import com.lynn.myagentscopejava.core.tool.ToolParam;
 import com.lynn.myagentscopejava.core.tool.ToolSchema;
+import com.lynn.myagentscopejava.core.cluster.impl.LocalNotificationBus;
 import com.lynn.myagentscopejava.core.tool.Toolkit;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Flux;
@@ -133,5 +134,56 @@ class ToolConfirmationHookTest {
         agent.call(Msg.user("user", "扣 500"));
         assertEquals(0, payment.callCount.get());
         assertTrue(agent.isAwaitingHumanInput());
+    }
+
+    @Test
+    void crossNodeBroadcastSyncsDangerousTools() {
+        // 模拟两节点：共享同一 LocalNotificationBus（单进程内的 LocalBus 等价于 Redis bus 的语义）
+        LocalNotificationBus bus = new LocalNotificationBus();
+        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+
+        ToolConfirmationHook nodeA = new ToolConfirmationHook(Set.of(), bus, mapper);
+        ToolConfirmationHook nodeB = new ToolConfirmationHook(Set.of(), bus, mapper);
+
+        assertTrue(nodeA.getDangerousTools().isEmpty());
+        assertTrue(nodeB.getDangerousTools().isEmpty());
+
+        // Node A 改清单 + 广播
+        nodeA.setDangerousToolsAndBroadcast(Set.of("deduct", "delete_file"));
+
+        // Node A 立即生效
+        assertTrue(nodeA.isDangerous("deduct"));
+        assertTrue(nodeA.isDangerous("delete_file"));
+
+        // Node B 通过订阅接收同步
+        assertTrue(nodeB.isDangerous("deduct"));
+        assertTrue(nodeB.isDangerous("delete_file"));
+
+        // Node B 改 → Node A 同步
+        nodeB.setDangerousToolsAndBroadcast(Set.of("transfer_money"));
+        assertFalse(nodeA.isDangerous("deduct"));
+        assertTrue(nodeA.isDangerous("transfer_money"));
+
+        nodeA.close();
+        nodeB.close();
+    }
+
+    @Test
+    void closeReleasesSubscription() {
+        LocalNotificationBus bus = new LocalNotificationBus();
+        ToolConfirmationHook hook = new ToolConfirmationHook(Set.of(), bus, null);
+        assertEquals(1, bus.subscriberCount(ToolConfirmationHook.CONFIG_CHANNEL));
+        hook.close();
+        assertEquals(0, bus.subscriberCount(ToolConfirmationHook.CONFIG_CHANNEL));
+    }
+
+    @Test
+    void singleNodeNoBusFallback() {
+        // 老构造（无 bus）应当依然工作，setDangerousToolsAndBroadcast 退化为本地修改
+        ToolConfirmationHook hook = new ToolConfirmationHook(Set.of("a"));
+        hook.setDangerousToolsAndBroadcast(Set.of("b", "c"));
+        assertFalse(hook.isDangerous("a"));
+        assertTrue(hook.isDangerous("b"));
+        assertTrue(hook.isDangerous("c"));
     }
 }
