@@ -282,25 +282,56 @@ public class AgentAutoConfiguration {
     }
 
     /**
-     * 默认的 Session bean，使用 {@link FileSystemSession} 落盘。
+     * 单机模式 Session bean：用 {@link FileSystemSession} 落盘到本地目录。
+     *
+     * <p>仅当 {@code agentscope.cluster.mode != distributed} 时启用（默认 single）。
      * 落盘目录由 {@code agentscope.session.dir} 配置（默认 {@code ./.agent-state}）。
      */
     @Bean
-    public Session session(AgentProperties props) {
+    @ConditionalOnMissingBean
+    @ConditionalOnProperty(prefix = "agentscope.cluster", name = "mode",
+            havingValue = "single", matchIfMissing = true)
+    public Session fileSystemSession(AgentProperties props) {
         return new FileSystemSession(Path.of(props.getSession().getDir()));
     }
 
     /**
-     * 多会话目录服务：每个用户可以有多个独立的对话。
+     * 单机模式对话目录：与 {@link FileSystemSession} 同根目录。
      */
     @Bean
-    public ConversationDirectory conversationDirectory(AgentProperties props) {
+    @ConditionalOnMissingBean
+    @ConditionalOnProperty(prefix = "agentscope.cluster", name = "mode",
+            havingValue = "single", matchIfMissing = true)
+    public ConversationDirectory fileSystemConversationDirectory(AgentProperties props) {
         return new FileSystemConversationDirectory(Path.of(props.getSession().getDir()));
     }
 
     /**
-     * 跨 ChatService 调用共享的 per-key 锁管理器。
+     * 分布式模式 Session bean：用 PostgreSQL JSONB 列存储。
+     *
+     * <p>启用条件：{@code agentscope.cluster.mode=distributed}。
+     * 表结构由 Flyway 在启动时通过 {@code db/migration/V1__init_distributed_schema.sql} 创建，
+     * 所以应用必须配 {@code spring.datasource.*}。
      */
+    @Bean
+    @ConditionalOnMissingBean
+    @ConditionalOnProperty(prefix = "agentscope.cluster", name = "mode", havingValue = "distributed")
+    public Session postgresSession(org.springframework.jdbc.core.JdbcTemplate jdbc,
+                                   com.fasterxml.jackson.databind.ObjectMapper mapper) {
+        return new com.lynn.myagentscopejava.core.session.PostgresSession(jdbc, mapper);
+    }
+
+    /**
+     * 分布式模式对话目录：PostgreSQL conversations 表。
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    @ConditionalOnProperty(prefix = "agentscope.cluster", name = "mode", havingValue = "distributed")
+    public ConversationDirectory postgresConversationDirectory(
+            org.springframework.jdbc.core.JdbcTemplate jdbc) {
+        return new com.lynn.myagentscopejava.core.conversation.PostgresConversationDirectory(jdbc);
+    }
+
     /**
      * 分布式锁。单机部署用 {@link LocalDistributedLock}（进程内 ReentrantLock）；
      * 分布式部署可换 {@code RedisDistributedLock}（Redisson）。

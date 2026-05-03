@@ -26,6 +26,7 @@ public class AgentProperties {
     private final ToolsConfig tools = new ToolsConfig();
     private final Http http = new Http();
     private final Hitl hitl = new Hitl();
+    private final Cluster cluster = new Cluster();
 
     public String getName() { return name; }
     public void setName(String name) { this.name = name; }
@@ -40,6 +41,7 @@ public class AgentProperties {
     public ToolsConfig getTools() { return tools; }
     public Http getHttp() { return http; }
     public Hitl getHitl() { return hitl; }
+    public Cluster getCluster() { return cluster; }
 
     /**
      * 多 provider 配置：openai / anthropic / gemini 可同时启用。
@@ -145,6 +147,20 @@ public class AgentProperties {
             public int getPort() { return port; }
             public void setPort(int port) { this.port = port; }
         }
+    }
+
+    /**
+     * 分布式部署配置。
+     *
+     * <p>{@code mode=single}（默认）：所有状态走进程内 / 文件系统，无需外部依赖
+     * <br>{@code mode=distributed}：会话、对话目录走 PostgreSQL；分布式锁 / pub-sub 走 Redis
+     */
+    public static class Cluster {
+        /** {@code single}（默认） 或 {@code distributed}。 */
+        private String mode = "single";
+
+        public String getMode() { return mode; }
+        public void setMode(String mode) { this.mode = mode; }
     }
 
     /**
