@@ -1,0 +1,4 @@
+# 复制本文件为 application-local.properties 后填入真实 api-key。
+# application-local.properties 已被 .gitignore，不会进入版本控制。
+
+agentscope.model.api-key=sk-your-deepseek-key-here
